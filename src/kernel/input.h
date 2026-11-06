@@ -1,0 +1,107 @@
+#ifndef INPUT_H
+#define INPUT_H
+
+#include <stdint.h>
+
+/* Blocking read of one key from the serial console or the USB keyboard.
+ * While waiting it polls USB and refreshes the uptime in the status bar. */
+char input_getc(void);
+
+/* Non-blocking: next key from serial or USB keyboard, or -1. */
+int input_key(void);
+/* For the tools opened from the menu, input_key also turns controller
+ * buttons into keys: B or Start is Esc; with INPUT_PAD_NAV (the pager) also
+ * up/down arrows, left/right PgUp/PgDn, A Enter. 0 turns it off. */
+#define INPUT_PAD_ESC 1
+#define INPUT_PAD_NAV 2
+void input_pad_keys(int mode);
+/* Keys typed on a remote terminal: the serial port or the network
+ * console (bm_net.py); -1 if none. Menus and games read them as text. */
+int input_remote_getc(void);
+int input_remote_ready(void);
+/* A remote key given back: the next input_key / input_remote_getc returns
+ * it (the menu hands a ':' to the monitor, the rest of the line behind it). */
+void input_unget(int c);
+/* After a remote Esc: does more follow within 30 ms (an arrow key)? */
+int input_remote_follows(void);
+/* After an Esc from input_getc: if a terminal sequence follows (an arrow,
+ * PgUp: ESC [ ... final letter or ~), reads it all; returns 1. A lone Esc
+ * (the USB keyboard's): 0, nothing read. */
+int input_skip_sequence(void);
+/* A line typed on the keyboard, the serial port or the network console,
+ * echoed (as '*' if secret); Enter ends it. Its length, -1 on Esc. */
+int input_read_line(char *buf, int max, int secret);
+/* What input_key returns once when a cartridge sent over the network
+ * (bm_net.py --play) waits to be played: the monitor plays it. */
+#define INPUT_NET_PLAY 0x10
+/* The monitor's wait for a command: like input_getc, but the PS button of
+ * a controller (home) ends it with INPUT_HOME: back to the games menu. */
+#define INPUT_HOME 0x11
+int input_getc_home(void);
+
+/* Polls USB and returns the game buttons held on the USB keyboard or
+ * gamepad (HID_* bits); *quit gets HID_QUIT_KEY once per Esc /
+ * Start+Select, HID_QUIT_PS once per PS button (callers set it to 0). */
+uint32_t input_buttons(int *quit);
+
+#define INPUT_PLAYERS 4
+
+/* Local multiplayer (M16): Bluetooth pad n is player n; the USB keyboard or
+ * gamepad and the serial console play as the first player without a pad
+ * (0-based here), or -1 when all four players have one. */
+int input_local_player(void);
+/* The Bluetooth LE keyboard is a player of its own: the next one without a
+ * pad after the USB player, or that one when nothing is on USB; -1 when it
+ * is not connected (or no player is free: then it plays with the USB one). */
+int input_ble_player(void);
+
+/* Like input_buttons, per player: out[0] = player 1. Returns the OR of all;
+ * *local = input_local_player(). text: the keyboard types (left out). */
+uint32_t input_players(uint32_t out[INPUT_PLAYERS], int text, int *quit, int *local);
+
+/* Players with a controller: bit n = player n+1. The local player counts
+ * when a USB keyboard or gamepad is attached, or when no pad is connected
+ * (then it is the serial console, or nobody yet); the Bluetooth keyboard's
+ * player counts while it is connected. */
+unsigned input_connected(void);
+
+/* Left stick of player p (0-based), -1..1 each (x right, y down); from the
+ * direction buttons for keyboards and pads without a stick. */
+void input_stick(int p, uint32_t buttons, float *x, float *y);
+/* The right stick of player p (0..3), with a dead zone; 0, 0 without one. */
+void input_stick_r(int p, float *x, float *y);
+
+/* What player p (0-based) plays with: a Bluetooth pad or a USB gamepad,
+ * a USB or Bluetooth keyboard, or nothing (the serial console does not
+ * count); INPUT_DEV_BLUETOOTH is added when it comes over Bluetooth. */
+#define INPUT_DEV_NONE      0
+#define INPUT_DEV_KEYBOARD  1
+#define INPUT_DEV_PAD       2
+#define INPUT_DEV_BLUETOOTH 0x10
+#define INPUT_DEV_KIND      0x0F    /* the bits of the kind: KEYBOARD, PAD or NONE */
+/* what kind of pad (for the games' icons, controller() in Lua): the DS4's
+ * symbols, an Xbox pad's letters (A at the bottom), the console's own
+ * controls (the RGB30: A on the right, B at the bottom); none: a pad with
+ * letters as an Xbox one */
+#define INPUT_DEV_DS4       0x20
+#define INPUT_DEV_XBOX      0x40
+#define INPUT_DEV_BUILTIN   0x80
+int input_device(int p);
+
+/* The game's button (HID_A or HID_B) that says yes (back = 0) or goes back
+ * (back = 1), as the system's menus do: the DS4's cross and circle, an
+ * Xbox pad's A and B; on the RGB30 what confirm= and game_buttons= say
+ * (B, the lower one, confirms). */
+uint32_t input_ok_bit(int back);
+/* The letter a pad shows for the game's button `bit` (HID_*): the same,
+ * or its neighbour when the face buttons are taken by position (the
+ * RGB30 with game_buttons=position: the game's A is the button marked B). */
+uint32_t input_face_shown(uint32_t bit);
+
+/* Monitor 'Y': the buttons each player holds, live for `seconds`. */
+void input_live_test(uint32_t seconds);
+
+/* Drops keys typed on the USB keyboard while a game was running. */
+void input_flush(void);
+
+#endif

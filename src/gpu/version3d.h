@@ -1,0 +1,143 @@
+#ifndef GPU_VERSION3D_H
+#define GPU_VERSION3D_H
+
+/*
+ * The version of bm's 3D drivers, "bm3d X.Y": X the block of work (a
+ * milestone), Y its step (docs/DRIVERS.md). The drivers are r3d (scene,
+ * transform, light, the ARM's rasterizer) and gpu3d (the V3D's backend and
+ * shaders); one version for both. A new block or step raises it and adds a
+ * line to the table below.
+ *
+ * The settings reproduce older versions on today's code (the "mode"): the
+ * ARM alone is 0.2, the GPU without its vertex shader 2.1, with it for the
+ * scenery 3.0, for every model 3.4, with the frame in the queue 4.1, with
+ * the jobs' memory uncached 4.5 (gpu3d_wc: the 3D Bench's GPU+WC), with
+ * the 2D over the 3D in the job 4.8 (gpu3d_2d: GPU+2D), with two jobs in
+ * flight 5.1 (gpu3d_queue=2: GPU+VS+Q2), with 16-bit textures 5.2
+ * (gpu3d_tex16: GPU+T16), with two-thread pixel shaders 5.3 (gpu3d_fs2:
+ * GPU+FS2), with the meshes nearest first 5.4 and their
+ * triangles in the vertex cache's order 5.6 (gpu3d_sort: GPU+VS+S), with
+ * each frame shown a frame later 6.9 (gpu3d_later, with the two jobs of
+ * 5.1), with compact attributes 7.1 (gpu3d_attr: GPU+VS+A8); 7.2 adds the
+ * cut-out sheets as RGBA5551 to gpu3d_tex16 (GPU+T16), with the opaque
+ * sheets as ETC1 7.3 (gpu3d_etc1: GPU+ETC1), with the cel light on the ARM
+ * (cel3d, draw3d flag 256) and dither3d 7.4, with the cel light in the vertex programs and the
+ * outline by the inverted hull (flag 512) 7.5, with the draws of many small
+ * static meshes merged (gpu3d_merge) 7.6, with the shadows that darken on the GPU
+ * (shadow3d(0); shadow3d(1) is the screen-door of 7.6) 7.7. 0.1 and 1.0 no longer run: the 3D Bench shows the
+ * numbers measured on the Pi with them.
+ */
+#define BM3D_VERSION "7.36"
+#define BM3D_BLOCK   "vs"
+
+typedef struct {
+    const char *version, *block, *date, *what;
+} bm3d_version_t;
+
+/* every version, oldest first; *n of them */
+static inline const bm3d_version_t *bm3d_versions(int *n)
+{
+    static const bm3d_version_t v[] = {
+        { "0.1", "M7-M32", "2026-09", "ARM only: r3d's first rasterizer (the September stress test)" },
+        { "0.2", "M33", "2026-10-01", "ARM only: edges in fixed point, specialized texture loops, DMA z clear" },
+        { "1.0", "M33", "2026-10-01", "the GPU draws the triangles, the ARM places and lights them" },
+        { "2.0", "M34", "2026-10-01", "cleared pages, textures in T-format, MSAA 4x, less ARM a triangle" },
+        { "2.1", "M34", "2026-10-03", "Overbit on the GPU: screen-door, baked RGB light, shadows, effects" },
+        { "3.0", "vs", "2026-10-03", "vertex shader for the scenery, clipping on the GPU" },
+        { "3.1", "vs", "2026-10-03", "vertex shader for models lit by the sun, with bones (heroes)" },
+        { "3.2", "vs", "2026-10-03", "vertex shader for shadows and the first-person layer" },
+        { "3.3", "vs", "2026-10-03", "textured models lit by the sun: Gouraud, on the vertex shader too" },
+        { "3.4", "vs", "2026-10-03", "skins on the vertex shader: faces on two bones (the Meshy heroes)" },
+        { "4.0", "queue", "2026-10-03", "the frame in the queue: the GPU draws while the game's next update runs" },
+        { "4.1", "queue", "2026-10-03", "2D after 3D recorded while the GPU draws, zclear() inside the job" },
+        { "4.2", "M38", "2026-10-04", "screens up to 1920x1080 (screen()), cls() cleared by the GPU's job" },
+        { "4.3", "vs", "2026-10-05", "the vertex shader's VPM offsets in bytes, as the V3D wants; the probe learns it" },
+        { "4.4", "queue", "2026-10-05", "no early z after a zclear() in the job nor with MSAA; the queue without VS" },
+        { "4.5", "queue", "2026-10-05", "the jobs' memory uncached, the ARM's writes merged (option)" },
+        { "4.6", "queue", "2026-10-05", "up to 8 textures in a job (2 before: a third ended it)" },
+        { "4.7", "M34", "2026-10-05", "textured screen-door faces on the GPU too (the last case left to the ARM)" },
+        { "4.8", "2D", "2026-10-05", "2D over the 3D in the GPU's job, pixel for pixel; textures filtered (options)" },
+        { "4.9", "2D", "2026-10-05", "the ARM's 3D: one matrix a model, lit in its own axes (option r3d_fast)" },
+        { "5.0", "mesh", "2026-10-05", "meshes up to 65535 vertices; indexed: a shared corner shaded once" },
+        { "5.1", "jobs2", "2026-10-05", "two jobs in flight: a job filled while the one before is drawn (option)" },
+        { "5.2", "tex16", "2026-10-05", "opaque textures as RGB565 in tiles, layout learned by the probe (option)" },
+        { "5.3", "fs2", "2026-10-05", "textured faces shaded with two threads a QPU, checked by the probe (option)" },
+        { "5.4", "sort", "2026-10-05", "the meshes' draws nearest first: early z skips the hidden pixels (option)" },
+        { "5.5", "pvs", "2026-10-05", "visible3d and pvs3d: characters hidden by the map skipped (Overbit)" },
+        { "5.6", "vcache", "2026-10-05", "each mesh's triangles in the vertex cache's order (with the draw order option)" },
+        { "6.0", "Mali", "2026-10-05", "RGB30: the Mali-G52 powered, mapped, running jobs (GPU test); no drawing yet" },
+        { "6.1", "Mali", "2026-10-05", "RGB30: a Mali fragment job clears tiles into a surface and on the screen" },
+        { "6.2", "fs2", "2026-10-05", "V3D: shaders without thread switches said single-threaded (GPU+FS2 hung)" },
+        { "6.3", "fs2", "2026-10-05", "two threads for every 3D shader (GPU+FS2); early z kept in MSAA jobs that clear" },
+        { "6.4", "fs2", "2026-10-06", "textured shaders with two threads by default; the colour ones lock the scoreboard last" },
+        { "6.5", "vs", "2026-10-06", "vertex shader probe: also with the clipper on as Mesa, V3D errors logged; shadows counted" },
+        { "6.6", "vs", "2026-10-06", "the vertex shader on by default (every model), as the Pi drew it with the clipper on" },
+        { "6.7", "vs", "2026-10-06", "vertex shader: a mesh's copy for each texture; sun-lit textures with three varyings" },
+        { "6.8", "vs", "2026-10-06", "vertex shader: a mesh's corners no longer written past their copy (the heap broken)" },
+        { "6.9", "later", "2026-10-11", "each frame shown a frame later: the next _draw runs while the GPU draws it (option)" },
+        { "7.0", "M38", "2026-10-12", "draw3d flag 128 and textures3d(): textured faces as flat colours (their average texel)" },
+        { "7.1", "attr", "2026-10-12", "compact attributes: colour and light bytes packed, unpacked by the vertex shader (option)" },
+        { "7.2", "tex16", "2026-10-12", "cut-out sheets as RGBA5551 with the 16-bit textures, the TMU's order probed (option)" },
+        { "7.3", "etc1", "2026-10-12", "opaque sheets as ETC1, encoded when made, the TMU's block layout probed (option)" },
+        { "7.4", "cel", "2026-10-22", "cel3d() and draw3d flag 256: the sun light in bands by a 64-entry table (ARM lighting); dither3d()" },
+        { "7.5", "cel", "2026-10-22", "cel light in the lit vertex programs (V3D); outline by the inverted hull (draw3d flag 512)" },
+        { "7.6", "merge", "2026-10-23", "draws of many small static baked or unlit meshes merged (gpu3d_merge; compact attributes stay off by default)" },
+        { "7.7", "shadow", "2026-10-23", "shadows (draw3d flag 8) darken on the GPU: fs_shadow reads the pixel (colour load) and keeps 5/8 of it, as the ARM; the screen-door stays for shadow3d(1) and with MSAA" },
+        { "7.8", "Mali", "2026-10-25", "RGB30: a Mali triangle drawn by the GPU (vertex, tiler and fragment jobs verified on hardware)" },
+        { "7.9", "Mali", "2026-10-25", "RGB30: Mali 3D Bench flat colours run on hardware with mali3d=1 (report 94aae9dd)" },
+        { "7.10", "Mali", "2026-10-25", "RGB30: multi-draw batching (phase 2) on Mali GPU: 64-byte attribute alignment, verified on hardware (report fcfd2933)" },
+        { "7.11", "Mali", "2026-10-25", "RGB30: BM_VS3 vertex shader with 4x4 matrix (phase 3) verified on Mali GPU (report b041b71a)" },
+        { "7.12", "Mali", "2026-10-25", "RGB30: asynchronous 2-set queue (phase 4, mali_frame_submit) verified on Mali GPU (report 9e4652bd)" },
+        { "7.13", "Mali", "2026-10-25", "RGB30: BM_VS3 mesh path (gpu3d_vshader) and async queue (gpu3d_queue) wired into mali_backend and 3D Bench" },
+        { "7.14", "Mali", "2026-10-25", "RGB30: cached 2 MB resolve surface (dc civac), 8-pixel resolve, and 8192-triangle merge-sorted scene batching in mali_backend" },
+        { "7.15", "Mali", "2026-10-25", "RGB30: mali3d on by default, 4 MB 1024-draw / 8192-triangle single-pass GPU arena and L1-cached descriptor packing" },
+        { "7.16", "Mali", "2026-10-27", "gpu2d_only (hidden, off): a game with no 3D has its 2D drawn by the V3D; the job opens with the first quad; dark_begin starts it" },
+        { "7.17", "Mali", "2026-10-28", "Opaque textures on the Mali (BM_FS_TEX, mali_tex=1); 3D Bench pixel check (K lines)" },
+        { "7.18", "Mali", "2026-10-28", "Hardware depth test on the Mali (mali_z=1): no far-to-near sort, one frame holds all the triangles" },
+        { "7.36", "Mali", "2026-11-05", "Mali: a face of a cached rigid mesh wholly outside the screen is not sent (the GPU vertex work, the copy and the wait fall; Dark Night: frames within 16.7 ms 2% -> 50% of the samples); the log line mali: 60 jobs gives the ARM time of the backend" },
+        { "7.35", "Mali", "2026-11-05", "Mali: the shadows on the GPU (the screen-door of shadow3d(1) with BM_FS_SCR, the blend of style 0 as target * 5/8), the faces that cross the near plane cut and cached, the shadows drawn last (Dark Night no longer hands the 3D to the ARM)" },
+        { "7.34", "Mali", "2026-11-05", "Mali: exact depth (depth source fixed function; before, the last draw always won), textured meshes first, a flat per-triangle face keeps its 1/depth, skinned faces across a joint use the bone of each corner (the Dark Night enemies are cached meshes), BM_VS_TEXX (lamps, rim light and cel levels on textured meshes), unlit meshes in the cache, mali_alpha on by default" },
+        { "7.33", "vs", "2026-10-31", "V3D: plain colour faces of a skin on two bones in the vertex shader (vs_lit2): a continuous skin stays on the GPU" },
+        { "7.32", "Mali", "2026-10-29", "Textured meshes in the Mali vertex shader (BM_VS_TEXM): a map chunk costs the ARM 0.6 ms, not 5.8 ms (hero, 0 heroes)" },
+        { "7.31", "Mali", "2026-10-29", "Each frame shown a frame later (gpu3d_later) on the Mali: the page of the held frame uses the real page step of the RGB30; a cls belongs to its frame" },
+        { "7.30", "Mali", "2026-10-29", "A cls() with the 3D on the GPU: the first resolve fills the page, so a frame split in jobs keeps its first jobs (hero showed no map, 50 heroes, 6 visible)" },
+        { "7.29", "Mali", "2026-10-29", "Each frame shown a frame later on the Mali (gpu3d_queue=2, gpu3d_later=1): the ARM draws the next frame while the GPU works; heroes 14.1 -> 8.5 ms" },
+        { "7.28", "Mali", "2026-10-28", "4x MSAA in the Mali tile buffer (mali_msaa=1, off): the edges of the triangles are smooth, spheres -8%" },
+        { "7.27", "Mali", "2026-10-28", "A frame holds 10922 faces of cached meshes (area R2): heroes 13.7 -> 14.8, queue +14%" },
+        { "7.26", "Mali", "2026-10-28", "Face cache of the lit meshes on the Mali (mali_res=1): spheres GPU+VS 130 -> 257, heroes 6.8 -> 13.7" },
+        { "7.25", "Mali", "2026-10-28", "Sprites of up to 16 sheets share a 2D draw on the Mali (BM_FS_SPR picks the texture): sprites test 1702 -> 3569" },
+        { "7.24", "Mali", "2026-10-28", "Cel levels in the Mali vertex shader; 3D Bench tests cel_flat_lit and cel_flat (flat hero, the Pi and the RGB30)" },
+        { "7.23", "Mali", "2026-10-28", "2D rectangles and sprites on the Mali (mali_2d=1, off: gpu2d -14% on the ARM-fast RGB30)" },
+        { "7.22", "Mali", "2026-10-28", "Bilinear textures on the Mali (gpu3d_filter): the Sampler filters; 3D Bench bilinear 126.6" },
+        { "7.21", "Mali", "2026-10-28", "Skinned meshes lit by the Mali vertex shader (BM_VS_LITB, a bone palette): heroes 3.4 -> 6.8; 3D Bench pixel check KC line" },
+        { "7.20", "Mali", "2026-10-28", "Rim light, lamps, gloss and fog of rigid meshes in the Mali vertex shader (BM_VS_LITX): spheres_shine 48.5 -> 125.7" },
+        { "7.19", "Mali", "2026-10-28", "Sun and ambient light of rigid meshes in the Mali vertex shader (BM_VS_LIT, mali_lit=1, mali_lit_min): one draw a mesh" },
+    };
+    *n = (int)(sizeof v / sizeof v[0]);
+    return v;
+}
+
+/* the version a renderer reproduces: gpu (the V3D draws), vs (its vertex
+ * shader: 0, 1 the scenery, 2 every model), queue (the frame in the queue,
+ * bm3d 4.1) */
+static inline const char *bm3d_mode_q(int gpu, int vs, int queue)
+{
+    if (!gpu)
+        return "0.2";
+    if (queue)
+        return "4.1";
+    return vs >= 2 ? "3.4" : vs == 1 ? "3.0" : "2.1";
+}
+
+static inline const char *bm3d_mode(int gpu, int vs)
+{
+    return bm3d_mode_q(gpu, vs, 0);
+}
+
+/* the same, later: each frame shown a frame later (bm3d 6.9, gpu3d_later) */
+static inline const char *bm3d_mode_l(int gpu, int vs, int queue, int later)
+{
+    return gpu && later ? "6.9" : bm3d_mode_q(gpu, vs, queue);
+}
+
+#endif

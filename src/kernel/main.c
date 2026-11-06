@@ -1,0 +1,327 @@
+/*
+ * bm kernel entry.
+ *
+ * ACT LED protocol:
+ *   solid on               -> init in progress (stuck here = early hang)
+ *   1 Hz heartbeat         -> running (driven by the 1 kHz timer IRQ)
+ *   N blinks + pause       -> fatal exception number N (9 = panic)
+ */
+#include <stdint.h>
+
+#include "irq.h"
+#include "tick.h"
+#include "exceptions.h"
+#include "fiber.h"
+#include "monitor.h"
+#include "sysinfo.h"
+#include "arch/mmu.h"
+#include "drivers/fb.h"
+#include "drivers/led.h"
+#include "drivers/mmio.h"
+#include "drivers/prop.h"
+#include "drivers/rng.h"
+#include "drivers/sd.h"
+#include "fs/fat.h"
+#include "drivers/timer.h"
+#include "drivers/uart.h"
+#include "gfx/console.h"
+#include "gfx/font.h"
+#include "lib/heap.h"
+#include "lib/printf.h"
+#include "script/luavm.h"
+#include "bm/runtime.h"
+#include "usb/usb.h"
+#include "carts.h"
+#include "config.h"
+#include "gpu/gpu3d.h"
+#include "gpu/qpu.h"
+#include "gpu/v3d.h"
+#include "bt/bt.h"
+#include "audio/audio.h"
+#include "crumbs.h"
+#include "kernel/sdlog.h"
+#include "reports.h"
+#include "drivers/mbox.h"
+#include "drivers/watchdog.h"
+#include "drivers/dma.h"
+#include "version.h"
+#include "net/net.h"
+#include "wifi/wifi.h"
+#include "net/wifi_auto.h"
+#include "usb/smsc95xx.h"
+#include "drivers/board.h"
+#include "drivers/gpio.h"
+#include "drivers/spilcd.h"
+#include "ledstate.h"
+#include "notice.h"
+
+#include <stdlib.h>
+#include <string.h>
+
+
+/* Low resolution, 16:9: the firmware scales it to the HDMI mode in hardware
+ * (x2 on 720p, x3 on 1080p), so drawing stays cheap. 80x22 text cells. */
+#define SCREEN_W 640
+#define SCREEN_H 360
+
+static framebuffer_t fb;
+
+#define TICK_HZ     1000
+
+static void heartbeat(uint32_t tick)
+{
+    fiber_tick();                               /* fiber_over: a fiber past its slice (fiber.h) */
+    ledstate_tick(tick * (1000 / TICK_HZ));     /* on, or a slow blink (ledstate.h) */
+    if (tick % (TICK_HZ / 10) == 0) {       /* 10 Hz: freeze guard */
+        watchdog_pet_irq();                 /* only while the main code makes progress */
+        crumb_tick(tick * (1000 / TICK_HZ));
+    }
+}
+
+/* Counts timer IRQs against the free-running counter for 200 ms. */
+static void report_irq(void)
+{
+    uint32_t t0 = timer_ticks(), n0 = tick_count();
+    timer_delay_us(200000);
+    uint32_t n = tick_count() - n0, us = timer_ticks() - t0;
+    kprintf("IRQ on: timer %lu Hz (measured %lu Hz), double buffer %s\n",
+            tick_hz(), (uint32_t)((uint64_t)n * 1000000u / us),
+            fb.buffers >= 2 ? "on" : "OFF");
+}
+
+/* End of the ARM's share of SDRAM (the GPU owns the rest). */
+static uint32_t arm_memory_end(void)
+{
+    uint32_t v[2] = { 0, 0 };
+    if (prop_query(PROP_GET_ARM_MEMORY, v, 2) != 0 || v[1] == 0 || v[0] + v[1] > PERIPHERAL_BASE)
+        return 0x10000000u;             /* 256 MB: safe for gpu_mem <= 256 */
+    return v[0] + v[1];
+}
+
+/* End of the SDRAM: the GPU's share sits on top of the ARM's. */
+static uint32_t sdram_end(uint32_t arm_end)
+{
+    uint32_t v[2] = { 0, 0 };
+    if (prop_query(PROP_GET_VC_MEMORY, v, 2) != 0 || v[0] + v[1] <= arm_end)
+        return 0x20000000u;             /* 512 MB: the Pi Zero, W and 2 W */
+    return v[0] + v[1];
+}
+
+/* The saved WiFi network is joined at boot (wifi_boot=0 in
+ * bm/config.txt turns it off), two tries; if it fails the menu tries
+ * again by itself (net/wifi_auto.c). The address comes later, in the
+ * background, and shows in the status line. */
+/* autoexec=1 in bm/config.txt: /bm/autoexec.lua runs once at boot, before the menu or the shell (SYS-19).
+ * A file of the card is code: it runs only when the owner turned the key on, and the PC and the bridge
+ * cannot set the key (config_merge). An error is printed and the boot goes on. */
+static void autoexec_run(void)
+{
+    const char *v = config_get("autoexec");
+    fat_entry_t e;
+    uint8_t *data = NULL;
+    size_t len = 0;
+    if (!v || v[0] != '1' || fat_find("/bm/autoexec.lua", &e) != 0 || e.is_dir)
+        return;
+    if (fat_load(&e, &data, &len) != 0) {
+        kprintf("autoexec: /bm/autoexec.lua: %s\n", fat_error());
+        return;
+    }
+    kprintf("autoexec: /bm/autoexec.lua\n");
+    if (luavm_init())                           /* (the state is made on first use) */
+        luavm_run((const char *)data, len, "=autoexec");
+    free(data);
+}
+
+static void wifi_boot(void)
+{
+    wifi_auto_boot();
+}
+
+/* The Ethernet of the Pi 1 B / B+ (found on the USB hub) starts at boot;
+ * DHCP waits for the cable's link. */
+static void eth_boot(void)
+{
+    if (eth_present())
+        net_start(&net_eth);
+}
+
+/* Heap, ARM clock, memory map and caches. */
+static void memory_init(void)
+{
+    uint32_t mem_end = arm_memory_end();
+    heap_init(mem_end);
+    prop_clock_set_max(CLOCK_ARM);
+    mmu_init(mem_end, sdram_end(mem_end));
+}
+
+/* The VideoCore firmware stopped answering (MBOX_DEAD_TIMEOUTS timeouts in a row): no mode change, no flip, the
+ * screen stays as it is while the network lives (26 Oct 2026, 3 hours after boot). Nothing here can revive it.
+ * The reset is not a planned one: the run is not marked as ended, so the next boot sends a freeze report with the
+ * last lines printed and this crumb. */
+static void firmware_dead(void)
+{
+    crumb("VideoCore firmware does not answer (mailbox)", NULL);
+    kprintf("\x1b[91mthe VideoCore firmware does not answer: restarting\x1b[0m\n");
+    watchdog_reboot();
+}
+
+/* The first mailbox timeout of a run: the state of the V3D beside the line mbox.c prints (the registers are read only
+ * when the 3D was started, so the V3D is on) */
+static void mbox_diag(void)
+{
+    if (!gpu3d_ready()) {
+        kprintf("mbox: the 3D is not started\n");
+        return;
+    }
+    char b[320];
+    v3d_errors(b, sizeof b);
+    kprintf("mbox: V3D %s\n", b);
+}
+
+static void pi_lastrun(void)
+{
+    uint32_t cpsr;
+    __asm__ volatile("mrs %0, cpsr" : "=r"(cpsr));
+    if ((cpsr & (1u << 7)) || fat_writing() || !sd_blocks())
+        return;
+    sdlog_lastrun();
+    uart_flush();
+}
+
+static void gpio_lcd_power(int on)
+{
+    if (!board_is_pi1())
+        return;
+    if (!on) {
+        spilcd_sleep(1);
+        gpio_set_function(18, GPIO_OUTPUT);
+        gpio_write(18, 0);
+        gpio_set_function(22, GPIO_OUTPUT);
+        gpio_write(22, 0);
+        gpio_set_function(8, GPIO_OUTPUT);
+        gpio_write(8, 1);
+        gpio_set_function(7, GPIO_OUTPUT);
+        gpio_write(7, 1);
+    } else {
+        spilcd_sleep(0);
+        gpio_set_function(18, GPIO_OUTPUT);
+        gpio_write(18, 1);
+        gpio_set_function(22, GPIO_OUTPUT);
+        gpio_write(22, 1);
+    }
+}
+
+void kernel_main(uint32_t atags)
+{
+#ifdef BM_ZERO2
+    /* Before anything else: until the MMU is on the Cortex-A53 of the Pi
+     * Zero 2 W sees the RAM as device memory, where the unaligned accesses
+     * that ARMv7 code (ours and the C library's) makes freely are alignment
+     * faults. */
+    memory_init();
+#endif
+    led_init();
+    led_set(1);
+    uart_init();
+
+    int err = fb_init(&fb, SCREEN_W, SCREEN_H, 2);
+    if (err == 0) {
+        exceptions_set_panic_fb(&fb);
+        console_init(&fb, &font_console_8x16);
+        char title[40];
+        ksnprintf(title, sizeof title, "bm %s", bm_version);
+        console_set_status(title, 0);
+        kprintf_set_sink(console_putc);
+    }
+
+    (void)atags;
+    if (err)
+        panic("framebuffer init failed (%d)", err);
+
+#ifndef BM_ZERO2
+    memory_init();
+#endif
+
+    /* the board is asked only now: at the very start a real Zero W gave
+     * a revision that is not its own (no WiFi, the LED on another pin) */
+    kprintf("\n\x1b[1;36mbm\x1b[0m kernel %s - Raspberry %s (%s, revision %06lx)\n", bm_version,
+            board()->name, BOARD_SOC, board()->revision);
+    led_init_board();
+
+    irq_init();
+    tick_init(TICK_HZ);
+    tick_set_hook(heartbeat);
+    irq_cpu_enable();
+    rng_start();                /* warms up while the rest boots (TLS, BLE keys) */
+
+    sysinfo_print_short();
+    int wd_rc = watchdog_arm(3000);
+    uint32_t ld, lf;
+    watchdog_probe_values(&ld, &lf);
+    if (wd_rc == -2)
+        kprintf("watchdog: resets at once on RSTC (emulator), no freeze guard\n");
+    else if (wd_rc != 0)
+        kprintf("watchdog: not available, no freeze guard (loaded %lu, after 20 ms %lu)\n", ld, lf);
+    else
+        kprintf("watchdog: on, 3000 ms (loaded %lu, after 20 ms %lu)\n", ld, lf);
+    crumbs_boot();
+    report_irq();
+    if (audio_init() == 0) {
+        kprintf("audio: %s\n", audio_status());
+        audio_note(0, 523, 90, 1, 110);         /* short chime: sound works */
+        audio_note(1, 784, 160, 1, 90);
+    } else {
+        kprintf("audio: off - %s\n", audio_status());
+    }
+    if (dma_init() != 0)
+        kprintf("dma: no free channel, copies by the CPU\n");
+    usb_init();
+    usb_print();
+    carts_init();
+    config_load();
+    if (gpu_qpu_key())                  /* gpu3d_qpu=1 (default off): Yharnam's darkness on the QPUs, ARM fallback */
+        bm_fade_accel = qpu_fade_hook;
+    if (board_is_pi1()) {
+        const char *lg = config_get("lcd_gpio");
+        if (lg && strcmp(lg, "1") == 0) {
+            gpio_lcd_power(1);
+        } else {
+            /* Default: turn off unused GPIO LCD backlight to save power on Pi 1 */
+            gpio_lcd_power(0);
+        }
+    }
+    sdlog_prev();
+    watchdog_before_reboot(pi_lastrun);
+    mbox_set_dead_hook(firmware_dead);
+    mbox_set_diag_hook(mbox_diag);
+    sdlog_boot(0);
+    {
+        /* v3d_clock=max in bm/config.txt: the GPU at the highest clock the
+         * firmware allows (enable_uart=1 holds the core at 250 MHz, and the
+         * V3D was seen at 250 too); a trial until the Pi's bench says */
+        const char *vc = config_get("v3d_clock");
+        if (vc && vc[0] == 'm')
+            kprintf("v3d: clock %lu MHz (v3d_clock=max)\n", prop_clock_set_max(CLOCK_V3D) / 1000000);
+    }
+    {
+        /* the boot before ended in a crash or a freeze: a report, with the
+         * lines printed before it; it goes by itself once on the network */
+        const char *kind;
+        size_t n;
+        const char *t = crumbs_last(&kind, &n);
+        if (t)
+            reports_text(kind, t, n);
+    }
+    if (bt_paired() && board()->wireless)
+        bt_start();             /* a paired pad can come back with its PS button */
+    wifi_boot();
+    eth_boot();
+
+    /* The console boots directly into the terminal shell (bm>). */
+    bm_set_notice(notice_now);              /* cartridges show a kernel arriving */
+    bm_permissions(1);                      /* a cartridge's network and reports: the user says */
+    ledstate_set(LED_BOOT, 0);              /* started: the LED stays on if all is well */
+    autoexec_run();
+    sdlog_boot(1);
+    monitor_run();
+}

@@ -1,0 +1,370 @@
+/*
+ * RGB565 drawing library for native bm cartridges (.bm).
+ * All drawing is clipped to the clip rectangle and offset by the camera.
+ * Colours are 16-bit RGB565 values (see g16_rgb).
+ */
+#ifndef GFX16_H
+#define GFX16_H
+
+#include <stdint.h>
+
+#include "gfx/font.h"
+
+#define G16_CELL 8              /* sprite sheet / map cell size in pixels */
+
+typedef struct {
+    int w, h;                   /* pixels, multiples of G16_CELL */
+    uint16_t *px;               /* RGB565 */
+    uint8_t *alpha;             /* 1 = opaque */
+    uint8_t *cell_opaque;       /* per 8x8 cell: 1 if every pixel is opaque */
+    uint32_t version;           /* changes with every g16_sheet_set / _update_cell, and is
+                                 * new for every sheet allocated (copies, e.g. a GPU texture) */
+    /* g16_map: the opaque cells it draws, packed one after the other (128 bytes a cell, 8 rows of 16 bytes). A cell of a wide
+     * sheet is 8 rows 8 KB apart, so reading it costs 8 cache misses; a packed cell costs 4 lines in a row. Made when a cell is
+     * first drawn, dropped when the sheet changes (tver != version); a sheet that changes every frame turns it off (toff). */
+    uint16_t *tpool;            /* tcap cells of 64 pixels */
+    uint16_t *tslot;            /* per cell: its place in tpool + 1, 0 = not packed */
+    uint32_t *tcell;            /* per place: the cell it holds */
+    uint32_t tn, tcap, tver;
+    uint8_t toff, tresets;
+} g16_sheet_t;
+
+typedef struct {
+    int w, h;                   /* cells */
+    uint16_t *cells;            /* sprite index; 0 = empty */
+} g16_map_t;
+
+typedef enum {
+    G16_BLEND_NORMAL = 0,  /* Alpha: src over dst */
+    G16_BLEND_ADD,         /* Additive: dst + src */
+    G16_BLEND_SUB,         /* Subtractive: dst - src */
+    G16_BLEND_MUL,         /* Multiplicative: dst * src */
+    G16_BLEND_SCREEN,      /* Screen: 1 - (1-src)*(1-dst) */
+    G16_BLEND_NONE         /* Copy / Replace: dst = src */
+} g16_blend_mode_t;
+
+typedef struct {
+    uint16_t *px;
+    uint32_t stride;            /* pixels per row */
+    int w, h;
+    int cx0, cy0, cx1, cy1;     /* clip rectangle, x1/y1 exclusive */
+    int cam_x, cam_y;
+    const font_t *font;
+    g16_blend_mode_t blend_mode;
+    uint8_t global_alpha;       /* 0..255, default 255 */
+    uint16_t palt_mask;         /* bitmask for transparent 16 colors, default 0x0001 */
+    int32_t color_key;          /* -1 if disabled, or RGB565 color */
+    uint64_t fillpat;           /* 8x8 bit pattern (default ~0ULL = solid) */
+    uint8_t fillpat_trans;      /* 1 = 0-bits transparent, 0 = draw fillpat_bg */
+    uint16_t fillpat_bg;        /* background color for 0-bits */
+} g16_t;
+
+static inline uint16_t g16_rgb(uint32_t r, uint32_t g, uint32_t b)
+{
+    return (uint16_t)((r >> 3) << 11 | (g >> 2) << 5 | (b >> 3));
+}
+
+static inline uint16_t g16_rgb24(uint32_t rgb)
+{
+    return g16_rgb(rgb >> 16 & 0xFF, rgb >> 8 & 0xFF, rgb & 0xFF);
+}
+
+/* RGB565 -> 0xRRGGBB with the low bits replicated */
+uint32_t g16_to_rgb24(uint16_t c);
+
+/* Blend src (RGB565) over dst (RGB565) with alpha a (0..255) */
+static inline uint16_t blend_rgb565(uint16_t src, uint16_t dst, uint8_t a)
+{
+    int s_r = (src >> 11) & 0x1f;
+    int s_g = (src >> 5) & 0x3f;
+    int s_b = src & 0x1f;
+    int d_r = (dst >> 11) & 0x1f;
+    int d_g = (dst >> 5) & 0x3f;
+    int d_b = dst & 0x1f;
+    int r = d_r + (((s_r - d_r) * (int)a + 128) >> 8);
+    int g = d_g + (((s_g - d_g) * (int)a + 128) >> 8);
+    int b = d_b + (((s_b - d_b) * (int)a + 128) >> 8);
+    if (r < 0) r = 0; else if (r > 31) r = 31;
+    if (g < 0) g = 0; else if (g > 63) g = 63;
+    if (b < 0) b = 0; else if (b > 31) b = 31;
+    return (uint16_t)((r << 11) | (g << 5) | b);
+}
+
+/* Blend src over dst according to blend mode and alpha (0..255) */
+static inline uint16_t g16_blend_pixel(uint16_t src, uint16_t dst, g16_blend_mode_t mode, uint8_t a)
+{
+    if (a == 0) return dst;
+    if (mode == G16_BLEND_NONE) return src;
+
+    int s_r = (src >> 11) & 0x1f;
+    int s_g = (src >> 5) & 0x3f;
+    int s_b = src & 0x1f;
+    int d_r = (dst >> 11) & 0x1f;
+    int d_g = (dst >> 5) & 0x3f;
+    int d_b = dst & 0x1f;
+
+    int r, g, b;
+
+    switch (mode) {
+    case G16_BLEND_ADD: {
+        int sa_r = (s_r * (int)a + 128) >> 8;
+        int sa_g = (s_g * (int)a + 128) >> 8;
+        int sa_b = (s_b * (int)a + 128) >> 8;
+        r = d_r + sa_r; if (r > 31) r = 31;
+        g = d_g + sa_g; if (g > 63) g = 63;
+        b = d_b + sa_b; if (b > 31) b = 31;
+        break;
+    }
+    case G16_BLEND_SUB: {
+        int sa_r = (s_r * (int)a + 128) >> 8;
+        int sa_g = (s_g * (int)a + 128) >> 8;
+        int sa_b = (s_b * (int)a + 128) >> 8;
+        r = d_r - sa_r; if (r < 0) r = 0;
+        g = d_g - sa_g; if (g < 0) g = 0;
+        b = d_b - sa_b; if (b < 0) b = 0;
+        break;
+    }
+    case G16_BLEND_MUL: {
+        int tr = (d_r * s_r * 33 + 512) >> 10;
+        int tg = (d_g * s_g * 65 + 2048) >> 12;
+        int tb = (d_b * s_b * 33 + 512) >> 10;
+        r = d_r + (((tr - d_r) * (int)a + 128) >> 8);
+        g = d_g + (((tg - d_g) * (int)a + 128) >> 8);
+        b = d_b + (((tb - d_b) * (int)a + 128) >> 8);
+        if (r < 0) r = 0; else if (r > 31) r = 31;
+        if (g < 0) g = 0; else if (g > 63) g = 63;
+        if (b < 0) b = 0; else if (b > 31) b = 31;
+        break;
+    }
+    case G16_BLEND_SCREEN: {
+        int tr = 31 - (((31 - d_r) * (31 - s_r) * 33 + 512) >> 10);
+        int tg = 63 - (((63 - d_g) * (63 - s_g) * 65 + 2048) >> 12);
+        int tb = 31 - (((31 - d_b) * (31 - s_b) * 33 + 512) >> 10);
+        r = d_r + (((tr - d_r) * (int)a + 128) >> 8);
+        g = d_g + (((tg - d_g) * (int)a + 128) >> 8);
+        b = d_b + (((tb - d_b) * (int)a + 128) >> 8);
+        if (r < 0) r = 0; else if (r > 31) r = 31;
+        if (g < 0) g = 0; else if (g > 63) g = 63;
+        if (b < 0) b = 0; else if (b > 31) b = 31;
+        break;
+    }
+    case G16_BLEND_NORMAL:
+    default:
+        r = d_r + (((s_r - d_r) * (int)a + 128) >> 8);
+        g = d_g + (((s_g - d_g) * (int)a + 128) >> 8);
+        b = d_b + (((s_b - d_b) * (int)a + 128) >> 8);
+        if (r < 0) r = 0; else if (r > 31) r = 31;
+        if (g < 0) g = 0; else if (g > 63) g = 63;
+        if (b < 0) b = 0; else if (b > 31) b = 31;
+        break;
+    }
+
+    return (uint16_t)((r << 11) | (g << 5) | b);
+}
+
+void g16_blend(g16_t *g, g16_blend_mode_t mode, uint8_t global_alpha);
+void g16_palt(g16_t *g, int c, int transparent);
+void g16_palt_reset(g16_t *g);
+void g16_fillpat(g16_t *g, uint64_t pat, int transparent, uint16_t bg);
+void g16_fillpat_reset(g16_t *g);
+void g16_colmat(g16_t *g, int x, int y, int w, int h, const float mat[9], const float offset[3]);
+
+void g16_target(g16_t *g, uint16_t *px, uint32_t stride, int w, int h, const font_t *font);
+void g16_clip(g16_t *g, int x, int y, int w, int h);    /* w or h <= 0: full screen */
+void g16_camera(g16_t *g, int x, int y);
+
+/* Off-screen render target surface (API-8) */
+typedef struct {
+    int w, h;
+    uint16_t *px;
+    uint8_t *alpha;
+} g16_target_t;
+
+int  g16_target_alloc(g16_target_t *t, int w, int h, int with_alpha);
+void g16_target_free(g16_target_t *t);
+void g16_target_clear(g16_target_t *t, uint16_t c);
+void g16_target_blit(g16_t *g, const g16_target_t *t, int dx, int dy,
+                     int dw, int dh, int sx, int sy, int sw, int sh,
+                     int flip_x, int flip_y);
+
+/* A w x h RGB565 picture (rows w apart) copied whole to (x, y), each pixel scale x scale (1..8), the camera
+ * and the clip as for g16_rectfill. */
+void g16_blit565(g16_t *g, const uint16_t *src, int w, int h, int x, int y, int scale);
+
+void g16_cls(g16_t *g, uint16_t c);
+void g16_pset(g16_t *g, int x, int y, uint16_t c);
+int  g16_pget(const g16_t *g, int x, int y);             /* -1 outside */
+void g16_line(g16_t *g, int x0, int y0, int x1, int y1, uint16_t c);
+void g16_rect(g16_t *g, int x, int y, int w, int h, uint16_t c);
+void g16_rectfill(g16_t *g, int x, int y, int w, int h, uint16_t c);
+void g16_circ(g16_t *g, int cx, int cy, int r, uint16_t c);
+void g16_circfill(g16_t *g, int cx, int cy, int r, uint16_t c);
+void g16_rrect(g16_t *g, int x, int y, int w, int h, int r, uint16_t c);
+void g16_rrectfill(g16_t *g, int x, int y, int w, int h, int r, uint16_t c);
+void g16_ellipse(g16_t *g, int cx, int cy, int rx, int ry, uint16_t c);
+void g16_ellipsefill(g16_t *g, int cx, int cy, int rx, int ry, uint16_t c);
+void g16_rectgrad(g16_t *g, int x, int y, int w, int h, uint32_t c0, uint32_t c1, uint32_t c2, uint32_t c3);
+
+/* Sprite n (8x8 cell index, row-major in the sheet), wc x hc cells. */
+void g16_spr(g16_t *g, const g16_sheet_t *s, int n, int x, int y,
+             int wc, int hc, int flip_x, int flip_y);
+/* Any rectangle of the sheet, unscaled. */
+void g16_sspr(g16_t *g, const g16_sheet_t *s, int sx, int sy, int sw, int sh,
+              int dx, int dy, int flip_x, int flip_y);
+/* The same, `zoom` times bigger (or smaller, below 1), nearest pixel: it
+ * covers round(sw * zoom) x round(sh * zoom) pixels of the screen. */
+void g16_sspr_zoom(g16_t *g, const g16_sheet_t *s, int sx, int sy, int sw, int sh,
+                   int dx, int dy, int flip_x, int flip_y, float zoom);
+/* Affine 2x2 transform of a sheet rectangle: (dx, dy) is anchor on screen,
+ * [a b; c d] matrix, (ox, oy) origin within the rectangle (e.g. sw/2, sh/2 for centre). */
+void g16_sspr_affine(g16_t *g, const g16_sheet_t *s, int sx, int sy, int sw, int sh,
+                     int dx, int dy, float a, float b, float c, float d, float ox, float oy);
+/* Sprite rotation around origin (ox, oy): rz radians, scale_x and scale_y. */
+void g16_sspr_rot(g16_t *g, const g16_sheet_t *s, int sx, int sy, int sw, int sh,
+                  int dx, int dy, float rz, float scale_x, float scale_y, float ox, float oy);
+/* Sprite blit with 8-bit alpha (global_alpha 0..255 and/or per-pixel coverage). */
+void g16_sspr_alpha(g16_t *g, const g16_sheet_t *s, int sx, int sy, int sw, int sh,
+                    int dx, int dy, int flip_x, int flip_y, int global_alpha);
+void g16_spr_alpha(g16_t *g, const g16_sheet_t *s, int n, int x, int y,
+                   int wc, int hc, int flip_x, int flip_y, int global_alpha);
+/* Sprite stacking: `n` slices of sw x sh, side by side on the sheet from
+ * (sx, sy), slice 0 is the bottom and is drawn first.  (x, y) is the centre of
+ * the bottom slice; each slice turns by `rz` (radians) around its centre, is
+ * `scale` times bigger and sits step * scale pixels above the one below.
+ * Colour 0 (alpha 0) is transparent.  Without turn and scale it equals n calls
+ * of g16_sspr. */
+void g16_stack(g16_t *g, const g16_sheet_t *s, int sx, int sy, int sw, int sh,
+               int n, int x, int y, float rz, float scale, float step);
+/* The same with the slices one under the other on the sheet from (sx, sy), top to
+ * bottom; the top one is slice 0 (the bottom of the stack). */
+void g16_stackv(g16_t *g, const g16_sheet_t *s, int sx, int sy, int sw, int sh,
+                int n, int x, int y, float rz, float scale, float step);
+/* Map cells [mx, mx+mw) x [my, my+mh) drawn at (x, y); cell 0 is skipped. */
+void g16_map(g16_t *g, const g16_sheet_t *s, const g16_map_t *m,
+             int mx, int my, int x, int y, int mw, int mh);
+/* The same, only the cells whose tile has a flag of `mask` (flags: a byte
+ * per 8x8 cell of the sheet, fget/fset); mask 0 or flags NULL: every cell. */
+void g16_map_mask(g16_t *g, const g16_sheet_t *s, const g16_map_t *m,
+                  int mx, int my, int x, int y, int mw, int mh, const uint8_t *flags, uint8_t mask);
+/* Text with the target's font (g->font), transparent background. Returns
+ * the end x. */
+int  g16_text(g16_t *g, int x, int y, const char *str, uint16_t c);
+/* The same, every font pixel drawn as a scale x scale square. */
+int  g16_text_scaled(g16_t *g, int x, int y, const char *str, uint16_t c, int scale);
+
+/* Lighting: a grid of light values every 4 pixels (8.8 fixed point, 256 =
+ * unchanged, up to 2x), filled with an ambient colour and soft round
+ * lights, then multiplied into the picture (interpolated, dithered). */
+typedef struct {
+    int w, h;                   /* screen pixels */
+    int nx, ny;                 /* nodes: w/4+1 x h/4+1 */
+    uint16_t *rgb;              /* 3 per node */
+} g16_light_t;
+
+int  g16_light_init(g16_light_t *l, int w, int h);
+void g16_light_free(g16_light_t *l);
+void g16_light_clear(g16_light_t *l, uint32_t ambient_rgb);   /* 0xFFFFFF = unlit picture */
+/* Adds a light at screen (x, y): full strength at the centre, zero at radius. */
+void g16_light_add(g16_light_t *l, float x, float y, float radius, uint32_t rgb, float intensity);
+void g16_light_apply(g16_t *g, const g16_light_t *l);
+
+/* Lighting by levels, as in Dank Tomb (PICO-8): every pixel gets a light
+ * level 0..levels-1 (the brightest lamp that reaches it: rings from the
+ * lamp's level at the centre down to 0 at its radius, the ring edges
+ * dithered 4x4), then each colour of the picture becomes the colour its
+ * fade table gives for that level. Colours without a table are scaled by
+ * the average of the tables at that level. */
+#define G16_FADE_LEVELS 16
+#define G16_FADE_COLOURS 255
+
+typedef struct {
+    int w, h;                   /* screen pixels */
+    int levels;                 /* 2..G16_FADE_LEVELS */
+    int ncol;                   /* colours with a table */
+    uint8_t *lv;                /* w x h levels */
+    int step;                   /* 1 (0): a level for each pixel; 2: the glows work on lv2, a level for each 2x2 pixels (g16_fade_set_step) */
+    int w2, h2;                 /* lv2's size: (w + 1) / 2 x (h + 1) / 2 */
+    uint8_t *lv2;               /* step 2: the half-size map the glows fill; g16_fade_flush copies it to lv */
+    uint8_t *index;             /* 65536: RGB565 -> its table, 255 = none */
+    uint16_t *tab;              /* G16_FADE_LEVELS x 256: the colour at each level */
+    uint16_t from[256];         /* the colour of each table */
+    uint16_t mul[G16_FADE_LEVELS][3];   /* the others: r, g, b x 256 */
+} g16_fade_t;
+
+int  g16_fade_init(g16_fade_t *f, int w, int h);
+void g16_fade_free(g16_fade_t *f);
+/* Forgets the tables; the next ones have `levels` levels (2..16). */
+void g16_fade_reset(g16_fade_t *f, int levels);
+/* The table of colour `from`: to[0] (darkest) .. to[levels-1]. Returns -1
+ * when there are already G16_FADE_COLOURS tables. */
+int  g16_fade_colour(g16_fade_t *f, uint16_t from, const uint16_t *to);
+/* After the tables: the scale of the colours without one. */
+void g16_fade_done(g16_fade_t *f);
+/* step 2: the glows and the clear work on a quarter of the pixels (light with the granularity of 2 pixels, a
+ * quarter of the time); step 1 (the default) is the full-size map. Returns -1 when there is no memory. */
+int  g16_fade_set_step(g16_fade_t *f, int step);
+/* At step 2 the half-size map is copied to lv, 2x2 pixels a level (g16_fade_apply reads lv2 itself; the QPU fade reads lv). At step 1: nothing. */
+void g16_fade_flush(g16_fade_t *f);
+void g16_fade_clear(g16_fade_t *f, int ambient);
+/* A lamp at screen (x, y): `level` at the centre, 0 at `radius`; dither
+ * 0..256 is how much of each ring edge is mixed (0 = sharp rings, 256 = a
+ * smooth ordered-dither ramp). */
+void g16_fade_glow(g16_fade_t *f, int x, int y, int radius, int level, int dither);
+void g16_fade_apply(g16_t *g, const g16_fade_t *f);
+
+/* Sheet helpers */
+int  g16_sheet_alloc(g16_sheet_t *s, int w, int h);
+void g16_sheet_free(g16_sheet_t *s);
+void g16_sheet_set(g16_sheet_t *s, int x, int y, uint16_t c, int opaque);
+void g16_sheet_set_alpha(g16_sheet_t *s, int x, int y, uint16_t c, uint8_t alpha);
+void g16_sheet_update_cell(g16_sheet_t *s, int cx, int cy);
+
+/* 2D Paths and Vector Polygons */
+typedef enum {
+    G16_FILL_EVEN_ODD = 0,
+    G16_FILL_NON_ZERO = 1
+} g16_fill_rule_t;
+
+typedef enum {
+    G16_PATH_MOVE = 0,
+    G16_PATH_LINE = 1,
+    G16_PATH_CLOSE = 2
+} g16_path_cmd_t;
+
+typedef struct {
+    float x, y;
+    uint8_t cmd;
+} g16_path_pt_t;
+
+typedef struct {
+    g16_path_pt_t *pts;
+    int count;
+    int cap;
+    float cur_x, cur_y;
+    float start_x, start_y;
+    int has_start;
+} g16_path_t;
+
+
+void g16_path_init(g16_path_t *p);
+void g16_path_free(g16_path_t *p);
+void g16_path_reset(g16_path_t *p);
+void g16_path_move_to(g16_path_t *p, float x, float y);
+void g16_path_line_to(g16_path_t *p, float x, float y);
+void g16_path_quad_to(g16_path_t *p, float cx, float cy, float x, float y);
+void g16_path_cubic_to(g16_path_t *p, float c1x, float c1y, float c2x, float c2y, float x, float y);
+void g16_path_arc(g16_path_t *p, float cx, float cy, float r, float a0, float a1);
+void g16_path_close(g16_path_t *p);
+
+void g16_path_fill(g16_t *g, const g16_path_t *p, uint16_t c, g16_fill_rule_t rule);
+void g16_path_stroke(g16_t *g, const g16_path_t *p, uint16_t c, float width);
+
+void g16_poly(g16_t *g, const float *pts, int count, uint16_t c, int closed);
+void g16_polyfill(g16_t *g, const float *pts, int count, uint16_t c, g16_fill_rule_t rule);
+
+/* Filters & radial gradients */
+void g16_blur(g16_t *g, int x, int y, int w, int h, int radius, int passes);
+void g16_conv3(g16_t *g, int x, int y, int w, int h, const int16_t kernel[9], int divisor, int offset);
+void g16_radgrad(g16_t *g, int cx, int cy, int r, uint32_t c0, uint32_t c1);
+
+#endif
